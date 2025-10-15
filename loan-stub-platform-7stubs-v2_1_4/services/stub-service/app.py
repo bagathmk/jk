@@ -1,0 +1,210 @@
+import os
+import time
+from typing import Dict, Any, Tuple
+import requests
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse
+import uvicorn
+from pymongo import MongoClient, ReturnDocument
+from pymongo.read_concern import ReadConcern
+from pymongo.write_concern import WriteConcern
+from pymongo.read_preferences import ReadPreference
+from pymongo.errors import ServerSelectionTimeoutError, ConnectionFailure, OperationFailure
+
+from opentelemetry import trace, propagate
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.trace import Status, StatusCode
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.requests import RequestsInstrumentor
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.instrumentation.pymongo import PymongoInstrumentor
+
+SERVICE_NAME = os.getenv("SERVICE_NAME", "stub-service")
+SERVICE_PORT = int(os.getenv("SERVICE_PORT", "7001"))
+STAGE_NAME = os.getenv("STAGE_NAME", "STAGE")
+DOWNSTREAM_URL = os.getenv("DOWNSTREAM_URL", "").strip()
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/loan?replicaSet=rs0")
+OTEL_EXPORTER_OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "otel-collector:4317")
+
+resource = Resource.create({"service.name": SERVICE_NAME})
+provider = TracerProvider(resource=resource)
+processor = BatchSpanProcessor(OTLPSpanExporter(endpoint=OTEL_EXPORTER_OTLP_ENDPOINT, insecure=True))
+provider.add_span_processor(processor)
+trace.set_tracer_provider(provider)
+tracer = trace.get_tracer(__name__)
+
+app = FastAPI(title=SERVICE_NAME)
+FastAPIInstrumentor().instrument_app(app, tracer_provider=provider)
+RequestsInstrumentor().instrument()
+PymongoInstrumentor().instrument()
+
+client = MongoClient(MONGO_URI, retryWrites=True, serverSelectionTimeoutMS=5000)
+db = client.get_database()
+
+# Ensure indexes (idempotent)
+try:
+    db.transactions.create_index([("loanId", 1), ("stage", 1), ("ts", -1)])
+    db.events.create_index([("loanId", 1), ("stage", 1), ("ts", -1)])
+except Exception:
+    pass
+
+def _has_writable_primary() -> Tuple[bool, str]:
+    try:
+        hello = client.admin.command("hello")
+        if hello.get("isWritablePrimary", False):
+            return True, "ok"
+        return False, "no writable primary yet"
+    except Exception:
+        try:
+            ism = client.admin.command("isMaster")
+            if ism.get("ismaster", False):
+                return True, "ok"
+            return False, "no writable primary yet (isMaster)"
+        except Exception as ex2:
+            return False, f"hello/isMaster failed: {ex2}"
+
+def mongo_is_ready() -> Tuple[bool, str]:
+    try:
+        client.admin.command("ping")
+        writable, reason = _has_writable_primary()
+        if not writable:
+            return False, reason
+        db["__ready__"].with_options(write_concern=WriteConcern(w="majority")).update_one(
+            {"_id": "ready"}, {"$set": {"ts": int(time.time()*1000)}}, upsert=True
+        )
+        s = client.start_session(); s.end_session()
+        return True, "ok"
+    except Exception as ex:
+        return False, str(ex)
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": SERVICE_NAME, "stage": STAGE_NAME}
+
+@app.get("/ready")
+def ready():
+    ok, reason = mongo_is_ready()
+    if ok:
+        return {"ready": True}
+    return JSONResponse(status_code=503, content={"ready": False, "reason": reason})
+
+def handle_process(loanId: str, amount: float, fail: bool) -> Dict[str, Any]:
+    start_ms = int(time.time() * 1000)
+    headers = {}
+    propagate.inject(headers)
+
+    with tracer.start_as_current_span(f"{STAGE_NAME}.handle") as span:
+        ctx = span.get_span_context()
+        trace_id_hex = format(ctx.trace_id, "032x")
+
+        span.set_attribute("loan.id", loanId)
+        span.set_attribute("stage", STAGE_NAME)
+        span.set_attribute("amount", amount)
+        span.set_attribute("downstream.url", DOWNSTREAM_URL or "none")
+        span.set_attribute("mongo.uri", MONGO_URI)
+        span.set_attribute("mongo.operation", "transaction")
+        span.add_event("mongo_transaction_started")
+
+        session = None
+        status = "PENDING"
+
+        try:
+            ok, reason = mongo_is_ready()
+            if not ok:
+                raise HTTPException(status_code=503, detail=f"Mongo not ready: {reason}")
+
+            try:
+                session = client.start_session()
+            except (ServerSelectionTimeoutError, ConnectionFailure, OperationFailure) as e:
+                raise HTTPException(status_code=503, detail=f"MongoDB not ready for transactions: {e}")
+
+            def txn_body(sess):
+                now = int(time.time() * 1000)
+                db.events.with_options(write_concern=WriteConcern(w="majority")).insert_one(
+                    {"loanId": loanId, "stage": STAGE_NAME, "action": "ENTER", "ts": now}, session=sess
+                )
+                db.transactions.with_options(write_concern=WriteConcern(w="majority")).find_one_and_update(
+                    {"loanId": loanId, "stage": STAGE_NAME},
+                    {"$set": {"status": "IN_PROGRESS", "ts": now, "amount": amount, "traceId": trace_id_hex}},
+                    upsert=True,
+                    return_document=ReturnDocument.AFTER,
+                    session=sess
+                )
+                if fail:
+                    raise RuntimeError(f"Injected failure at stage={STAGE_NAME}")
+                db.transactions.update_one(
+                    {"loanId": loanId, "stage": STAGE_NAME},
+                    {"$set": {"status": "COMMITTED"}},
+                    session=sess
+                )
+
+            session.with_transaction(
+                txn_body,
+                read_concern=ReadConcern("local"),
+                write_concern=WriteConcern(w="majority"),
+                read_preference=ReadPreference.PRIMARY,
+            )
+            status = "COMMITTED"
+            span.add_event("mongo_transaction_committed")
+
+        except HTTPException:
+            raise
+        except Exception as ex:
+            status = "ABORTED"
+            span.record_exception(ex)
+            span.set_status(Status(StatusCode.ERROR, str(ex)))
+            span.add_event("mongo_transaction_aborted", {"error": str(ex)})
+            now = int(time.time() * 1000)
+            try:
+                db.transactions.update_one(
+                    {"loanId": loanId, "stage": STAGE_NAME},
+                    {"$set": {"status": "ABORTED", "ts": now, "error": str(ex), "traceId": trace_id_hex}},
+                    upsert=True
+                )
+            except Exception:
+                pass
+            raise HTTPException(status_code=500, detail=f"{STAGE_NAME} failed: {ex}") from ex
+        finally:
+            if session is not None:
+                try:
+                    session.end_session()
+                except Exception:
+                    pass
+
+        elapsed_ms = int(time.time() * 1000) - start_ms
+        result = {
+            "service": SERVICE_NAME,
+            "stage": STAGE_NAME,
+            "loanId": loanId,
+            "amount": amount,
+            "status": status,
+            "elapsedMs": elapsed_ms,
+            "traceId": trace_id_hex,
+            "downstream": None,
+        }
+
+        if DOWNSTREAM_URL:
+            try:
+                resp = requests.post(
+                    f"{DOWNSTREAM_URL}?loanId={loanId}&amount={amount}&fail=false",
+                    headers=headers,
+                    timeout=8
+                )
+                result["downstream"] = resp.json()
+            except Exception as ex:
+                span.add_event("downstream_error", {"message": str(ex)})
+
+        return result
+
+@app.post("/process")
+async def process_endpoint(
+    loanId: str = Query(...),
+    amount: float = Query(0.0),
+    fail: bool = Query(False),
+):
+    return handle_process(loanId=loanId, amount=amount, fail=fail)
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=SERVICE_PORT, log_level="info")

@@ -1,0 +1,8 @@
+{
+  "dependencies": {
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.205.0",
+    "@opentelemetry/instrumentation-mongodb": "^0.58.3",
+    "@opentelemetry/sdk-node": "^0.205.0"
+  }
+}

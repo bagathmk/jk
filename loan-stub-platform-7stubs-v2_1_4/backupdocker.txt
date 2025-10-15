@@ -1,0 +1,276 @@
+version: "3.9"
+
+networks:
+  observability:
+    driver: bridge
+
+volumes:
+  mongo_data: {}
+  jaeger_data: {}
+
+services:
+  mongodb:
+    image: mongo:7
+    restart: unless-stopped
+    container_name: mongodb
+    hostname: mongodb
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "27017:27017"
+    networks:
+      - observability
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'db.adminCommand({ ping: 1 })' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  mongo-rs-setup:
+    image: mongo:7
+    container_name: mongo-rs-setup
+    networks:
+      - observability
+    depends_on:
+      - mongodb
+    restart: "on-failure"
+    entrypoint: ["/bin/bash", "-lc"]
+    command: |
+      set -e
+      echo 'Waiting for mongod to accept connections...'
+      until mongosh --host mongodb:27017 --quiet --eval 'db.adminCommand({ ping: 1 })' ; do
+        echo 'Waiting for MongoDB...'
+        sleep 2
+      done
+      echo 'Ensuring replica set initialized and host correct...'
+      mongosh --host mongodb:27017 --quiet --eval '
+        function ensureRs() {
+          try { rs.status(); return "ok"; } catch(e) {
+            rs.initiate({_id:"rs0", members:[{_id:0, host:"mongodb:27017"}]});
+            return "initiated";
+          }
+        }
+        print(ensureRs());
+        try {
+          var cfg = rs.conf();
+          if (cfg.members && cfg.members.length>0 && cfg.members[0].host !== "mongodb:27017") {
+            cfg.members[0].host = "mongodb:27017";
+            rs.reconfig(cfg, {force:true});
+            print("reconfig to mongodb:27017");
+          }docker exec -it mongodb mongosh --quiet
+        } catch(e) { print(e); }
+      '
+      echo 'Waiting for writable PRIMARY...'
+      for i in {1..60}; do
+        if mongosh --host mongodb:27017 --quiet --eval 'var h=db.adminCommand({hello:1}); if (h.isWritablePrimary) { print("PRIMARY"); } else { quit(1); }' ; then
+          echo 'PRIMARY ready'
+          exit 0
+        fi
+        sleep 2
+      done
+      echo 'Timed out waiting for PRIMARY'
+      exit 1
+
+  otel-collector:
+    image: otel/opentelemetry-collector:latest
+    restart: unless-stopped
+    container_name: otel-collector
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    ports:
+      - "4320:4317"
+      - "4319:4318"
+    networks:
+      - observability
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    restart: unless-stopped
+    container_name: jaeger
+    user: "0"                          # run as root to avoid FS perms issues
+    environment:
+      # Enable OTLP and bind to all interfaces (required for 1.59+)
+      - COLLECTOR_OTLP_ENABLED=true
+      - COLLECTOR_OTLP_GRPC_HOST_PORT=0.0.0.0:4317
+      - COLLECTOR_OTLP_HTTP_HOST_PORT=0.0.0.0:4318
+      - SPAN_STORAGE_TYPE=badger
+      - BADGER_EPHEMERAL=false
+      - BADGER_DIRECTORY_VALUE=/badger/data
+      - BADGER_DIRECTORY_KEY=/badger/index
+      - BADGER_SPAN_STORE_TTL=120h          # keep spans ~5 days
+      - BADGER_MAINTENANCE_INTERVAL=120h     # periodic compaction/GC
+      - BADGER_TRUNCATE=true
+      - MONGO_URL=mongodb://mongodb:27017
+      - MONGO_DATABASE=loan
+      - MONGO_COLLECTION=transactions  
+    volumes:
+      - jaeger_data:/badger            # writable mount for Badger
+    ports:
+      - "16686:16686"                  # UI
+      - "4322:4317"                    # OTLP gRPC
+      - "4310:4318"                   # OTLP HTTP
+      - "6831:6831/udp"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:16686"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    networks:
+      - observability
+
+  loan-application-service:
+    build:
+      context: ./services/stub-service
+    container_name: loan-application-service
+    environment:
+      SERVICE_NAME: loan-application-service
+      SERVICE_PORT: "7001"
+      STAGE_NAME: LOAN_APPLICATION
+      DOWNSTREAM_URL: "http://customer-service:7002/process"
+      MONGO_URI: "mongodb://mongodb:27017/loan?replicaSet=rs0"
+      OTEL_EXPORTER_OTLP_PROTOCOL: "grpc"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+      OTEL_TRACES_SAMPLER: "always_on"
+      OTEL_RESOURCE_ATTRIBUTES: "deployment.environment=dev"
+    ports:
+      - "7001:7001"
+    depends_on:
+      - otel-collector
+      - mongo-rs-setup
+    networks:
+      - observability
+
+  customer-service:
+    build:
+      context: ./services/stub-service
+    container_name: customer-service
+    environment:
+      SERVICE_NAME: customer-service
+      SERVICE_PORT: "7002"
+      STAGE_NAME: CUSTOMER
+      DOWNSTREAM_URL: "http://credit-score-service:7003/process"
+      MONGO_URI: "mongodb://mongodb:27017/loan?replicaSet=rs0"
+      OTEL_EXPORTER_OTLP_PROTOCOL: "grpc"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+      OTEL_TRACES_SAMPLER: "always_on"
+      OTEL_RESOURCE_ATTRIBUTES: "deployment.environment=dev"
+    ports:
+      - "7002:7002"
+    depends_on:
+      - otel-collector
+      - mongo-rs-setup
+    networks:
+      - observability
+
+  credit-score-service:
+    build:
+      context: ./services/stub-service
+    container_name: credit-score-service
+    environment:
+      SERVICE_NAME: credit-score-service
+      SERVICE_PORT: "7003"
+      STAGE_NAME: CREDIT_SCORE
+      DOWNSTREAM_URL: "http://loan-approval-service:7004/process"
+      MONGO_URI: "mongodb://mongodb:27017/loan?replicaSet=rs0"
+      OTEL_EXPORTER_OTLP_PROTOCOL: "grpc"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+      OTEL_TRACES_SAMPLER: "always_on"
+      OTEL_RESOURCE_ATTRIBUTES: "deployment.environment=dev"
+    ports:
+      - "7003:7003"
+    depends_on:
+      - otel-collector
+      - mongo-rs-setup
+    networks:
+      - observability
+
+  loan-approval-service:
+    build:
+      context: ./services/stub-service
+    container_name: loan-approval-service
+    environment:
+      SERVICE_NAME: loan-approval-service
+      SERVICE_PORT: "7004"
+      STAGE_NAME: LOAN_APPROVAL
+      DOWNSTREAM_URL: "http://loan-disbursement-service:7005/process"
+      MONGO_URI: "mongodb://mongodb:27017/loan?replicaSet=rs0"
+      OTEL_EXPORTER_OTLP_PROTOCOL: "grpc"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+      OTEL_TRACES_SAMPLER: "always_on"
+      OTEL_RESOURCE_ATTRIBUTES: "deployment.environment=dev"
+    ports:
+      - "7004:7004"
+    depends_on:
+      - otel-collector
+      - mongo-rs-setup
+    networks:
+      - observability
+
+  loan-disbursement-service:
+    build:
+      context: ./services/stub-service
+    container_name: loan-disbursement-service
+    environment:
+      SERVICE_NAME: loan-disbursement-service
+      SERVICE_PORT: "7005"
+      STAGE_NAME: LOAN_DISBURSEMENT
+      DOWNSTREAM_URL: "http://notification-service:7007/process"
+      MONGO_URI: "mongodb://mongodb:27017/loan?replicaSet=rs0"
+      OTEL_EXPORTER_OTLP_PROTOCOL: "grpc"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+      OTEL_TRACES_SAMPLER: "always_on"
+      OTEL_RESOURCE_ATTRIBUTES: "deployment.environment=dev"
+    ports:
+      - "7005:7005"
+    depends_on:
+      - otel-collector
+      - mongo-rs-setup
+    networks:
+      - observability
+
+  repayment-service:
+    build:
+      context: ./services/stub-service
+    container_name: repayment-service
+    environment:
+      SERVICE_NAME: repayment-service
+      SERVICE_PORT: "7006"
+      STAGE_NAME: REPAYMENT
+      DOWNSTREAM_URL: ""
+      MONGO_URI: "mongodb://mongodb:27017/loan?replicaSet=rs0"
+      OTEL_EXPORTER_OTLP_PROTOCOL: "grpc"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+      OTEL_TRACES_SAMPLER: "always_on"
+      OTEL_RESOURCE_ATTRIBUTES: "deployment.environment=dev"
+    ports:
+      - "7006:7006"
+    depends_on:
+      - otel-collector
+      - mongo-rs-setup
+    networks:
+      - observability
+
+  notification-service:
+    build:
+      context: ./services/stub-service
+    container_name: notification-service
+    environment:
+      SERVICE_NAME: notification-service
+      SERVICE_PORT: "7007"
+      STAGE_NAME: NOTIFICATION
+      DOWNSTREAM_URL: ""
+      MONGO_URI: "mongodb://mongodb:27017/loan?replicaSet=rs0"
+      OTEL_EXPORTER_OTLP_PROTOCOL: "grpc"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+      OTEL_TRACES_SAMPLER: "always_on"
+      OTEL_RESOURCE_ATTRIBUTES: "deployment.environment=dev"
+    ports:
+      - "7007:7007"
+    depends_on:
+      - otel-collector
+      - mongo-rs-setup
+    networks:
+      - observability
+

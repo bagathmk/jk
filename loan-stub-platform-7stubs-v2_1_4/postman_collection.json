@@ -1,0 +1,36 @@
+{
+  "info": {
+    "name": "Loan Stub Platform v2.1.4",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Health Loan Application",
+      "request": {
+        "method": "GET",
+        "url": "http://localhost:7001/health"
+      }
+    },
+    {
+      "name": "Ready Loan Application",
+      "request": {
+        "method": "GET",
+        "url": "http://localhost:7001/ready"
+      }
+    },
+    {
+      "name": "E2E Happy Path",
+      "request": {
+        "method": "POST",
+        "url": "http://localhost:7001/process?loanId=L-10001&amount=50000&fail=false"
+      }
+    },
+    {
+      "name": "Fail at Credit Score",
+      "request": {
+        "method": "POST",
+        "url": "http://localhost:7003/process?loanId=L-FAIL01&amount=10000&fail=true"
+      }
+    }
+  ]
+}
